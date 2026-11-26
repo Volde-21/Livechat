@@ -12,6 +12,7 @@
 #include <d3d9.h>
 
 #include <algorithm>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -35,6 +36,22 @@ struct Config {
 
 static Config      g_cfg;
 static std::string g_iniPath;
+static std::string g_logPath;
+
+// Catatan diagnosa: livechat.log di folder yang sama dengan livechat.asi.
+// Isi ketikan pemain TIDAK pernah dicatat, hanya tahapan plugin.
+static void Log(const char* fmt, ...) {
+    if (g_logPath.empty()) return;
+    char msg[512];
+    va_list ap;
+    va_start(ap, fmt);
+    std::vsnprintf(msg, sizeof(msg), fmt, ap);
+    va_end(ap);
+    FILE* f = std::fopen(g_logPath.c_str(), "ab");
+    if (!f) return;
+    std::fprintf(f, "[%lu] %s\r\n", (unsigned long)GetTickCount(), msg);
+    std::fclose(f);
+}
 static HMODULE     g_self = nullptr;
 
 static int g_posX = 20;
@@ -60,6 +77,7 @@ static void LoadConfig() {
     GetModuleFileNameA(g_self, path, MAX_PATH);
     std::string dir = DirOf(path);
     g_iniPath = dir + "livechat.ini";
+    g_logPath = dir + "livechat.log";
 
     char s[MAX_PATH] = {0};
     GetPrivateProfileStringA("LiveChat", "File", "livechat.jsonl", s, MAX_PATH, g_iniPath.c_str());
@@ -168,17 +186,20 @@ static std::string g_typed;
 static LRESULT CALLBACK LcWndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     if (msg == WM_CHAR) {
         char c = (char)wp;
-        if (c == '\b') {
-            if (!g_typed.empty()) g_typed.pop_back();
-        } else if (c >= 32 && c < 127) {
-            g_typed += c;
-            if (g_typed.size() > 128) g_typed.erase(0, g_typed.size() - 128);
+        if (c == '/') {
+            g_typed = "/";                        // mulai buffer baru hanya saat ada '/'
+        } else if (!g_typed.empty()) {
+            if (c == '\b') {
+                g_typed.pop_back();
+            } else if (c >= 32 && c < 127) {
+                g_typed += c;
+                if (g_typed.size() > 64) g_typed.clear();
+            }
         }
     } else if (msg == WM_KEYDOWN) {
         if (wp == VK_RETURN) {
-            size_t p = g_typed.rfind('/');
-            if (p != std::string::npos) {
-                std::string cmd = g_typed.substr(p);
+            if (!g_typed.empty()) {
+                std::string cmd = g_typed;
                 for (size_t i = 0; i < cmd.size(); ++i)
                     if (cmd[i] >= 'A' && cmd[i] <= 'Z') cmd[i] = (char)(cmd[i] - 'A' + 'a');
                 if (cmd.compare(0, 3, "/lc") == 0) QueueCommand(cmd);
@@ -196,6 +217,7 @@ static void EnsureSubclass(HWND hwnd) {
     g_origWndProc = reinterpret_cast<WNDPROC>(
         SetWindowLongPtrA(hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(&LcWndProc)));
     g_subclassed = hwnd;
+    Log("jendela game di-subclass: hwnd=%p, wndproc lama=%p", (void*)hwnd, (void*)g_origWndProc);
 }
 
 static int TotalLines() {
@@ -636,6 +658,7 @@ static void ExecCommand(const std::string& raw, int sw, int sh) {
     size_t sp = c.find(' ');
     std::string name = (sp == std::string::npos) ? c : c.substr(0, sp);
     std::string args = (sp == std::string::npos) ? std::string() : c.substr(sp + 1);
+    Log("perintah diterima: %s", name.c_str());
 
     if (name == "lc") {
         g_enabled = !g_enabled;
@@ -731,25 +754,39 @@ typedef HRESULT (WINAPI *EndScene_t)(IDirect3DDevice9*);
 static EndScene_t g_origEndScene = nullptr;
 
 static DWORD g_lastRead = 0;
+static unsigned g_endSceneCalls = 0;
 
 static void RenderOverlay(IDirect3DDevice9* dev) {
+    static int  logNotBack = 0;
+    static bool loggedSameSize = false, loggedFirstDraw = false, loggedNoStateBlock = false, loggedResFail = false;
+
     // hanya gambar saat target render = backbuffer (EndScene dipanggil beberapa kali per frame)
     IDirect3DSurface9* rt = nullptr;
     IDirect3DSurface9* bb = nullptr;
     if (FAILED(dev->GetRenderTarget(0, &rt)) || !rt) return;
     if (FAILED(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb)) || !bb) { rt->Release(); return; }
-    bool isBack = (rt == bb);
-    D3DSURFACE_DESC desc;
+    D3DSURFACE_DESC desc, rdesc;
     std::memset(&desc, 0, sizeof(desc));
+    std::memset(&rdesc, 0, sizeof(rdesc));
     bb->GetDesc(&desc);
+    rt->GetDesc(&rdesc);
+    bool same = (rt == bb);
+    bool sameSize = rdesc.Width == desc.Width && rdesc.Height == desc.Height && rdesc.Format == desc.Format;
     rt->Release();
     bb->Release();
-    if (!isBack) return;
+    if (!same && !sameSize) {
+        if (logNotBack < 3) { ++logNotBack; Log("EndScene bukan backbuffer (target %ux%u, backbuffer %ux%u)", rdesc.Width, rdesc.Height, desc.Width, desc.Height); }
+        return;
+    }
+    if (!same && !loggedSameSize) { loggedSameSize = true; Log("target render bukan pointer backbuffer, tapi ukuran sama; tetap digambar"); }
 
     int sw = (int)desc.Width, sh = (int)desc.Height;
     if (sw < 320 || sh < 240) return;
 
-    if (!EnsureResources(dev, sw, sh)) return;
+    if (!EnsureResources(dev, sw, sh)) {
+        if (!loggedResFail) { loggedResFail = true; Log("EnsureResources GAGAL (layar %dx%d)", sw, sh); }
+        return;
+    }
 
     D3DDEVICE_CREATION_PARAMETERS cp;
     std::memset(&cp, 0, sizeof(cp));
@@ -789,7 +826,10 @@ static void RenderOverlay(IDirect3DDevice9* dev) {
     if (v1 > 1.0f) v1 = 1.0f;
 
     IDirect3DStateBlock9* sb = nullptr;
-    if (FAILED(dev->CreateStateBlock(D3DSBT_ALL, &sb)) || !sb) return;
+    if (FAILED(dev->CreateStateBlock(D3DSBT_ALL, &sb)) || !sb) {
+        if (!loggedNoStateBlock) { loggedNoStateBlock = true; Log("CreateStateBlock GAGAL"); }
+        return;
+    }
 
     SetCommonStates(dev, sw, sh);
 
@@ -818,15 +858,25 @@ static void RenderOverlay(IDirect3DDevice9* dev) {
 
     sb->Apply();
     sb->Release();
+
+    if (!loggedFirstDraw) {
+        loggedFirstDraw = true;
+        Log("gambar pertama berhasil: layar %dx%d, blok di (%d,%d) %dx%d, %d baris", sw, sh, x, y, w, h, (int)lines.size());
+    }
 }
 
 static HRESULT WINAPI hkEndScene(IDirect3DDevice9* dev) {
     static bool busy = false;
+    ++g_endSceneCalls;
+    if (g_endSceneCalls == 1) Log("hook EndScene DIPANGGIL game (dev=%p)", (void*)dev);
+    if (g_endSceneCalls == 2000) Log("EndScene sudah dipanggil 2000 kali, hook hidup");
     if (!busy && dev) {
         busy = true;
         try {
             RenderOverlay(dev);
         } catch (...) {
+            static bool loggedEx = false;
+            if (!loggedEx) { loggedEx = true; Log("EXCEPTION di RenderOverlay"); }
         }
         busy = false;
     }
@@ -840,15 +890,20 @@ typedef IDirect3D9* (WINAPI *Direct3DCreate9_t)(UINT);
 
 static bool InstallHook() {
     HMODULE d3d9 = GetModuleHandleA("d3d9.dll");
-    if (!d3d9) return false;
+    if (!d3d9) { Log("InstallHook: d3d9.dll belum dimuat"); return false; }
+    char d3dPath[MAX_PATH] = {0};
+    GetModuleFileNameA(d3d9, d3dPath, MAX_PATH);
+    Log("d3d9.dll dipakai: %s", d3dPath);
+    Log("samp.dll %s", GetModuleHandleA("samp.dll") ? "ADA" : "tidak ada");
+
     Direct3DCreate9_t create = reinterpret_cast<Direct3DCreate9_t>(GetProcAddress(d3d9, "Direct3DCreate9"));
-    if (!create) return false;
+    if (!create) { Log("InstallHook: Direct3DCreate9 tidak ditemukan"); return false; }
 
     IDirect3D9* d3d = create(D3D_SDK_VERSION);
-    if (!d3d) return false;
+    if (!d3d) { Log("InstallHook: Direct3DCreate9 mengembalikan NULL"); return false; }
 
     HWND wnd = CreateWindowExA(0, "STATIC", "lc_dummy", WS_OVERLAPPED, 0, 0, 64, 64, nullptr, nullptr, g_self, nullptr);
-    if (!wnd) { d3d->Release(); return false; }
+    if (!wnd) { Log("InstallHook: CreateWindowEx GAGAL (error %lu)", GetLastError()); d3d->Release(); return false; }
 
     D3DPRESENT_PARAMETERS pp;
     std::memset(&pp, 0, sizeof(pp));
@@ -861,10 +916,12 @@ static bool InstallHook() {
     HRESULT hr = d3d->CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, wnd,
                                    D3DCREATE_SOFTWARE_VERTEXPROCESSING | D3DCREATE_DISABLE_DRIVER_MANAGEMENT, &pp, &dev);
     if (FAILED(hr) || !dev) {
+        Log("CreateDevice HAL gagal (hr=0x%08lX), coba NULLREF", (unsigned long)hr);
         hr = d3d->CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_NULLREF, wnd,
                                D3DCREATE_SOFTWARE_VERTEXPROCESSING, &pp, &dev);
     }
     if (FAILED(hr) || !dev) {
+        Log("CreateDevice NULLREF juga gagal (hr=0x%08lX)", (unsigned long)hr);
         DestroyWindow(wnd);
         d3d->Release();
         return false;
@@ -878,7 +935,10 @@ static bool InstallHook() {
         g_origEndScene = reinterpret_cast<EndScene_t>(vtbl[ENDSCENE_INDEX]);
         vtbl[ENDSCENE_INDEX] = reinterpret_cast<void*>(&hkEndScene);
         VirtualProtect(&vtbl[ENDSCENE_INDEX], sizeof(void*), oldProt, &oldProt);
+        Log("vtable dipatch: vtbl=%p, EndScene asli=%p, hook=%p", (void*)vtbl, (void*)g_origEndScene, (void*)&hkEndScene);
         ok = true;
+    } else {
+        Log("VirtualProtect GAGAL (error %lu)", GetLastError());
     }
 
     dev->Release();
@@ -889,12 +949,16 @@ static bool InstallHook() {
 
 static DWORD WINAPI InitThread(LPVOID) {
     LoadConfig();
+    Log("==== livechat.asi v4 dimulai ====");
+    Log("ini=%s", g_iniPath.c_str());
+    Log("file komentar=%s", g_cfg.file.c_str());
     for (int i = 0; i < 1200; ++i) {                 // tunggu d3d9.dll (maks. 2 menit)
         if (GetModuleHandleA("d3d9.dll")) break;
         Sleep(100);
     }
     Sleep(2000);
-    InstallHook();
+    bool ok = InstallHook();
+    Log("InstallHook -> %s", ok ? "BERHASIL" : "GAGAL");
     return 0;
 }
 
