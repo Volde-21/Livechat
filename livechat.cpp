@@ -865,12 +865,70 @@ static void RenderOverlay(IDirect3DDevice9* dev) {
     }
 }
 
+// ---- daftar vtable yang sudah di-hook (tiap vtable punya EndScene asli sendiri) ----
+struct HookEntry { void** vtbl; EndScene_t orig; };
+static HookEntry g_hooks[8];
+static int g_hookCount = 0;
+
+static HRESULT WINAPI hkEndScene(IDirect3DDevice9* dev);
+
+static bool Readable(const void* p, size_t n) {
+    MEMORY_BASIC_INFORMATION mbi;
+    std::memset(&mbi, 0, sizeof(mbi));
+    if (!VirtualQuery(p, &mbi, sizeof(mbi))) return false;
+    if (mbi.State != MEM_COMMIT) return false;
+    if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return false;
+    const char* end = static_cast<const char*>(p) + n;
+    const char* regionEnd = static_cast<const char*>(mbi.BaseAddress) + mbi.RegionSize;
+    return end <= regionEnd;
+}
+
+// Patch EndScene (index 42) pada vtable milik objek device ini.
+static bool PatchDevice(void* dev) {
+    if (!dev || !Readable(dev, sizeof(void*))) return false;
+    void** vtbl = *reinterpret_cast<void***>(dev);
+    if (!vtbl || !Readable(&vtbl[42], sizeof(void*))) return false;
+
+    void* hook = reinterpret_cast<void*>(&hkEndScene);
+    if (vtbl[42] == hook) return true;               // sudah terpasang
+
+    int idx = -1;
+    for (int i = 0; i < g_hookCount; ++i) if (g_hooks[i].vtbl == vtbl) idx = i;
+    if (idx < 0) {
+        if (g_hookCount >= 8) return false;
+        idx = g_hookCount++;
+        g_hooks[idx].vtbl = vtbl;
+    }
+
+    DWORD oldProt = 0;
+    if (!VirtualProtect(&vtbl[42], sizeof(void*), PAGE_EXECUTE_READWRITE, &oldProt)) {
+        Log("VirtualProtect GAGAL (error %lu)", GetLastError());
+        return false;
+    }
+    g_hooks[idx].orig = reinterpret_cast<EndScene_t>(vtbl[42]);
+    vtbl[42] = hook;
+    VirtualProtect(&vtbl[42], sizeof(void*), oldProt, &oldProt);
+    Log("device di-patch: obj=%p vtbl=%p EndScene asli=%p", dev, (void*)vtbl, (void*)g_hooks[idx].orig);
+    return true;
+}
+
 static HRESULT WINAPI hkEndScene(IDirect3DDevice9* dev) {
     static bool busy = false;
+    static int depth = 0;
     ++g_endSceneCalls;
     if (g_endSceneCalls == 1) Log("hook EndScene DIPANGGIL game (dev=%p)", (void*)dev);
     if (g_endSceneCalls == 2000) Log("EndScene sudah dipanggil 2000 kali, hook hidup");
-    if (!busy && dev) {
+
+    EndScene_t orig = nullptr;
+    if (dev && Readable(dev, sizeof(void*))) {
+        void** vt = *reinterpret_cast<void***>(dev);
+        for (int i = 0; i < g_hookCount; ++i) if (g_hooks[i].vtbl == vt) { orig = g_hooks[i].orig; break; }
+    }
+    if (!orig && g_hookCount > 0) orig = g_hooks[0].orig;
+
+    bool outermost = (depth == 0);
+    ++depth;
+    if (outermost && !busy && dev) {
         busy = true;
         try {
             RenderOverlay(dev);
@@ -880,30 +938,34 @@ static HRESULT WINAPI hkEndScene(IDirect3DDevice9* dev) {
         }
         busy = false;
     }
-    return g_origEndScene(dev);
+    HRESULT r = orig ? orig(dev) : 0;
+    --depth;
+    return r;
 }
 
 // ============================================================
-//  Pasang hook (lewat vtable device dummy)
+//  Cari device milik game
 // ============================================================
+// GTA SA 1.0 US (dipakai SAMP 0.3.7): pointer IDirect3DDevice9 yang dipakai game ada di 0xC97C28
+static void* GameDevice() {
+    void* const* slot = reinterpret_cast<void* const*>(0xC97C28);
+    if (!Readable(slot, sizeof(void*))) return nullptr;
+    return *slot;
+}
+
+// Cara cadangan: device dummy (kurang andal, hanya dipakai kalau device game tidak ditemukan)
 typedef IDirect3D9* (WINAPI *Direct3DCreate9_t)(UINT);
 
-static bool InstallHook() {
+static bool InstallHookDummy() {
     HMODULE d3d9 = GetModuleHandleA("d3d9.dll");
-    if (!d3d9) { Log("InstallHook: d3d9.dll belum dimuat"); return false; }
-    char d3dPath[MAX_PATH] = {0};
-    GetModuleFileNameA(d3d9, d3dPath, MAX_PATH);
-    Log("d3d9.dll dipakai: %s", d3dPath);
-    Log("samp.dll %s", GetModuleHandleA("samp.dll") ? "ADA" : "tidak ada");
-
+    if (!d3d9) { Log("dummy: d3d9.dll belum dimuat"); return false; }
     Direct3DCreate9_t create = reinterpret_cast<Direct3DCreate9_t>(GetProcAddress(d3d9, "Direct3DCreate9"));
-    if (!create) { Log("InstallHook: Direct3DCreate9 tidak ditemukan"); return false; }
-
+    if (!create) { Log("dummy: Direct3DCreate9 tidak ditemukan"); return false; }
     IDirect3D9* d3d = create(D3D_SDK_VERSION);
-    if (!d3d) { Log("InstallHook: Direct3DCreate9 mengembalikan NULL"); return false; }
+    if (!d3d) { Log("dummy: Direct3DCreate9 mengembalikan NULL"); return false; }
 
     HWND wnd = CreateWindowExA(0, "STATIC", "lc_dummy", WS_OVERLAPPED, 0, 0, 64, 64, nullptr, nullptr, g_self, nullptr);
-    if (!wnd) { Log("InstallHook: CreateWindowEx GAGAL (error %lu)", GetLastError()); d3d->Release(); return false; }
+    if (!wnd) { Log("dummy: CreateWindowEx GAGAL (error %lu)", GetLastError()); d3d->Release(); return false; }
 
     D3DPRESENT_PARAMETERS pp;
     std::memset(&pp, 0, sizeof(pp));
@@ -916,31 +978,12 @@ static bool InstallHook() {
     HRESULT hr = d3d->CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, wnd,
                                    D3DCREATE_SOFTWARE_VERTEXPROCESSING | D3DCREATE_DISABLE_DRIVER_MANAGEMENT, &pp, &dev);
     if (FAILED(hr) || !dev) {
-        Log("CreateDevice HAL gagal (hr=0x%08lX), coba NULLREF", (unsigned long)hr);
-        hr = d3d->CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_NULLREF, wnd,
-                               D3DCREATE_SOFTWARE_VERTEXPROCESSING, &pp, &dev);
-    }
-    if (FAILED(hr) || !dev) {
-        Log("CreateDevice NULLREF juga gagal (hr=0x%08lX)", (unsigned long)hr);
+        Log("dummy: CreateDevice HAL gagal (hr=0x%08lX)", (unsigned long)hr);
         DestroyWindow(wnd);
         d3d->Release();
         return false;
     }
-
-    void** vtbl = *reinterpret_cast<void***>(dev);
-    const int ENDSCENE_INDEX = 42;
-    DWORD oldProt = 0;
-    bool ok = false;
-    if (VirtualProtect(&vtbl[ENDSCENE_INDEX], sizeof(void*), PAGE_EXECUTE_READWRITE, &oldProt)) {
-        g_origEndScene = reinterpret_cast<EndScene_t>(vtbl[ENDSCENE_INDEX]);
-        vtbl[ENDSCENE_INDEX] = reinterpret_cast<void*>(&hkEndScene);
-        VirtualProtect(&vtbl[ENDSCENE_INDEX], sizeof(void*), oldProt, &oldProt);
-        Log("vtable dipatch: vtbl=%p, EndScene asli=%p, hook=%p", (void*)vtbl, (void*)g_origEndScene, (void*)&hkEndScene);
-        ok = true;
-    } else {
-        Log("VirtualProtect GAGAL (error %lu)", GetLastError());
-    }
-
+    bool ok = PatchDevice(dev);
     dev->Release();
     d3d->Release();
     DestroyWindow(wnd);
@@ -949,16 +992,41 @@ static bool InstallHook() {
 
 static DWORD WINAPI InitThread(LPVOID) {
     LoadConfig();
-    Log("==== livechat.asi v4 dimulai ====");
+    Log("==== livechat.asi v5 dimulai ====");
     Log("ini=%s", g_iniPath.c_str());
     Log("file komentar=%s", g_cfg.file.c_str());
     for (int i = 0; i < 1200; ++i) {                 // tunggu d3d9.dll (maks. 2 menit)
         if (GetModuleHandleA("d3d9.dll")) break;
         Sleep(100);
     }
-    Sleep(2000);
-    bool ok = InstallHook();
-    Log("InstallHook -> %s", ok ? "BERHASIL" : "GAGAL");
+    char d3dPath[MAX_PATH] = {0};
+    GetModuleFileNameA(GetModuleHandleA("d3d9.dll"), d3dPath, MAX_PATH);
+    Log("d3d9.dll dipakai: %s", d3dPath);
+    Log("samp.dll %s", GetModuleHandleA("samp.dll") ? "ADA" : "tidak ada");
+
+    // cari device milik game (maks. ~90 detik)
+    bool hooked = false;
+    for (int i = 0; i < 900 && !hooked; ++i) {
+        void* d = GameDevice();
+        if (d) {
+            Log("device game ditemukan: %p", d);
+            hooked = PatchDevice(d);
+            Log("PatchDevice(device game) -> %s", hooked ? "BERHASIL" : "GAGAL");
+        }
+        if (!hooked) Sleep(100);
+    }
+    if (!hooked) {
+        Log("device game tidak ditemukan, pakai cara cadangan (device dummy)");
+        bool ok = InstallHookDummy();
+        Log("InstallHookDummy -> %s", ok ? "BERHASIL" : "GAGAL");
+    }
+
+    // pengawas: kalau SAMP / game mengganti device atau mengembalikan vtable, pasang ulang
+    for (;;) {
+        Sleep(1000);
+        void* d = GameDevice();
+        if (d) PatchDevice(d);
+    }
     return 0;
 }
 
