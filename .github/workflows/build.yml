@@ -1,0 +1,20 @@
+name: build-asi
+on:
+  workflow_dispatch:
+  push:
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure (Win32 / x86)
+        run: cmake -S . -B build -A Win32
+      - name: Build
+        run: cmake --build build --config Release
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: livechat-asi
+          path: |
+            build/Release/livechat.asi
+            livechat.ini
